@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  backend:
+    build: ./backend
+    expose:
+      - "5000"   # only internal
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"  # only this is public
+    depends_on:
+      - backend

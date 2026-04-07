@@ -3,20 +3,12 @@
  * Side-by-side comparison of failed vs successful testcase logs
  */
 
-import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { useParams } from 'react-router-dom';
 import { LogEntry, AlignedLogPair, LineDiff } from '@/types';
 import comparisonService from '@/services/comparisonService';
 import diffService from '@/services/diffService';
-import scrollSyncService, { ScrollMode } from '@/services/scrollSyncService';
 import { Button } from '@/components/ui/button';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import { AlertCircle, Loader2, FileText, ChevronDown, ChevronUp } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
@@ -36,12 +28,8 @@ const PassFailComparison: React.FC = () => {
   const [failedLogs, setFailedLogs] = useState<LogEntry[]>([]);
   const [successfulLogs, setSuccessfulLogs] = useState<LogEntry[]>([]);
   const [diffs, setDiffs] = useState<DiffResult[]>([]);
-  const [scrollMode, setScrollMode] = useState<ScrollMode>('sync');
   const [showRawView, setShowRawView] = useState(false);
-  const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
-
-  const leftScrollContainerRef = useRef<HTMLDivElement>(null);
-  const rightScrollContainerRef = useRef<HTMLDivElement>(null);
+  const [expandedMessages, setExpandedMessages] = useState<Record<string, boolean>>({});
 
   // Fetch logs on mount
   useEffect(() => {
@@ -86,7 +74,7 @@ const PassFailComparison: React.FC = () => {
   }, [testcaseId]);
 
   // Calculate diffs when logs change
-  useMemo(() => {
+  useEffect(() => {
     if (failedLogs.length === 0 || successfulLogs.length === 0) return;
 
     try {
@@ -102,35 +90,9 @@ const PassFailComparison: React.FC = () => {
     }
   }, [failedLogs, successfulLogs]);
 
-  // Handle scroll synchronization
-  const handleLeftScroll = useCallback(() => {
-    if (leftScrollContainerRef.current && rightScrollContainerRef.current) {
-      scrollSyncService.handleLeftScroll(
-        leftScrollContainerRef.current,
-        rightScrollContainerRef.current,
-        leftScrollContainerRef.current.scrollTop
-      );
-    }
-  }, []);
-
-  const handleRightScroll = useCallback(() => {
-    if (leftScrollContainerRef.current && rightScrollContainerRef.current) {
-      scrollSyncService.handleRightScroll(
-        leftScrollContainerRef.current,
-        rightScrollContainerRef.current,
-        rightScrollContainerRef.current.scrollTop
-      );
-    }
-  }, []);
-
-  const handleScrollModeChange = (mode: ScrollMode) => {
-    setScrollMode(mode);
-    scrollSyncService.setMode(mode);
-  };
-
-  // Helper to generate unique key for a log message
-  const getLogKey = (diffIndex: number, side: 'left' | 'right'): string => {
-    return `${diffIndex}-${side}`;
+  // Helper to generate unique key for a log message (shared between left and right)
+  const getLogKey = (pair: AlignedLogPair): string => {
+    return `${pair.failed?.lineNumber ?? 'x'}-${pair.successful?.lineNumber ?? 'y'}`;
   };
 
   // Helper to check if a message exceeds character limit
@@ -146,79 +108,245 @@ const PassFailComparison: React.FC = () => {
     return message;
   };
 
-  const renderDiffTokens = (tokens: any[]) => {
-    return tokens.map((token, tidx) => (
-      <span
-        key={tidx}
-        className={cn('', {
-          'bg-yellow-500/30 text-yellow-700 dark:text-yellow-400': token.type === 'modified',
-          'bg-red-500/30 text-red-600 dark:text-red-400': token.type === 'removed',
-          'bg-green-500/30 text-green-600 dark:text-green-400': token.type === 'added',
-        })}
-      >
-        {token.content}
-      </span>
-    ));
+  const renderDiffTokens = (
+  tokens: any[],
+  normalize: boolean = false,
+  isExtraLine: boolean = false
+) => {
+    return tokens.map((token, tidx) => {
+      // Normalize whitespace if needed (remove newlines, collapse spaces) - only when expanded
+      const content = token.content;
+
+      return (
+        <span
+          key={tidx}
+          className={cn({
+  'bg-yellow-500/30 text-yellow-700 dark:text-yellow-400':
+    token.type === 'modified' && !isExtraLine,
+  'bg-red-500/30 text-red-600 dark:text-red-400':
+    token.type === 'removed' && !isExtraLine,
+  'bg-green-500/30 text-green-600 dark:text-green-400':
+    token.type === 'added' && !isExtraLine,
+})}
+        >
+          {content}
+        </span>
+      );
+    });
   };
 
-  const renderLogContent = (log: LogEntry | null, diff: LineDiff, diffIndex: number, side: 'left' | 'right') => {
-    if (!log) return null;
+  /**
+   * RENDER LOG CONTENT WITH SYNCHRONIZED EXPAND/COLLAPSE
+   *
+   * SYNCHRONIZATION STRATEGY:
+   * ========================
+   * Both LEFT and RIGHT panels use IDENTICAL logic to ensure they stay in sync:
+   *
+   * 1. SHARED EXPANSION KEY:
+   *    - Both left and right panels receive the SAME diffIndex parameter
+   *    - Both generate the SAME key: `row-${diffIndex}`
+   *    - When button is clicked on either side, this key is added/removed from expandedMessages Set
+   *    - Since both panels check the same key, they get the same isExpanded value
+   *
+   * 2. SYNCHRONIZED TRUNCATION DECISION:
+   *    - Both panels calculate button visibility using BOTH messages (failedMsg + successMsg)
+   *    - Decision: `Math.max(failedMsg.length, successMsg.length) > MAX_INITIAL_CHARS`
+   *    - If EITHER message is long, BOTH panels show the button
+   *    - This prevents one side from showing button when the other doesn't
+   *
+   * 3. IDENTICAL TOKEN RENDERING:
+   *    - When isExpanded changes, ALL tokens are shown (both sides use same diff object)
+   *    - When collapsed, tokens are truncated at the SAME character count (300 chars)
+   *    - CSS classes respond to isExpanded state:
+   *      * Expanded:  whitespace-normal (continuous flow)
+   *      * Collapsed: whitespace-pre-wrap (preserved formatting)
+   *
+   * RESULT: When user clicks expand on EITHER side, BOTH sides expand with same CSS styling
+   */
+  const renderLogContent = (log: LogEntry | null, diff: LineDiff, rowKey: string, failedLog: LogEntry | null, successLog: LogEntry | null) => {
+    if (!log) {
+      return (   
+        <div className="flex flex-col gap-1 w-full px-4 py-2 font-mono text-sm opacity-50">
 
-    const logKey = getLogKey(diffIndex, side);
-    const isExpanded = expandedMessages.has(logKey);
+          <div className="flex w-full gap-3">
+            {/* Empty line number */}
+            <div className="w-12 text-right flex-shrink-0">
+              <span className="text-xs text-muted-foreground">-</span>
+            </div>
+
+            {/* Placeholder */}
+            <div className="flex-1 min-w-0 italic text-muted-foreground">
+              (no log)
+            </div>
+          </div>
+
+        </div>
+      );
+
+    }
+
+    // ========== SYNCHRONIZATION: Shared Expansion Key ==========
+    const expansionKey = rowKey; // Same for both left and right
+    const isExpanded = !!expandedMessages[expansionKey]; // Both read same key
+
+    // ========== SYNCHRONIZATION: Shared Truncation Decision ==========
+    const failedMsg = showRawView ? failedLog?.message : failedLog?.cleanLogMessage;
+    const successMsg = showRawView ? successLog?.message : successLog?.cleanLogMessage;
+    const maxMsgLength = Math.max(failedMsg?.length || 0, successMsg?.length || 0);
+
+    // ✅ CORRECT diff detection
+    const hasRealDiff =
+      diff?.tokens?.some(t => t.type === 'added' || t.type === 'removed' || t.type === 'modified') ?? false;
+
+    const isLongText = maxMsgLength > MAX_INITIAL_CHARS;
+
+    // ✅ Show button for every aligned row (diff/unchanged/long/short)
+    // This ensures same rows also have consistent collapse/expand behaviour.
+    const shouldShowButton = isLongText;
+
+    // Get the actual message for this panel
     const message = showRawView ? log.message : log.cleanLogMessage;
-    const isTruncated = shouldTruncate(message);
-    const displayMessage = isExpanded ? message : truncateMessage(message);
-    const remainingChars = message.length - MAX_INITIAL_CHARS;
+    const hasDiffTokens = diff && diff.tokens.length > 0;
+
+    const isExtraLine = !failedLog || !successLog;
+
+    // ========== BUILD DISPLAY CONTENT ==========
+    let displayTokens: any[] = [];
+    let shouldShowDiffTokens = false;
+
+    if (hasDiffTokens) {
+  shouldShowDiffTokens = true;
+
+  let charCount = 0;
+
+  for (const token of diff.tokens) {
+    if (!isExpanded && charCount >= MAX_INITIAL_CHARS) break;
+
+    const remaining = MAX_INITIAL_CHARS - charCount;
+
+    if (!isExpanded && token.content.length > remaining) {
+      displayTokens.push({
+        ...token,
+        content: token.content.substring(0, remaining),
+      });
+      break;
+    }
+
+    displayTokens.push(token);
+    charCount += token.content.length;
+  }
+}
+
 
     return (
-      <div className="flex flex-col gap-2">
-        <div className="flex items-start gap-3 px-4 py-2 font-mono text-sm break-words whitespace-pre-wrap">
-          <div className="flex-shrink-0 w-12 text-right">
-            <span className="text-xs text-muted-foreground">{log.lineNumber}</span>
+      <div className="flex flex-col gap-1 w-full overflow-x-hidden px-4 py-2 font-mono text-sm">
+
+        {/* TOP ROW: line number + content */}
+        <div className="flex w-full gap-3">
+
+          {/* Line number */}
+          <div className="w-12 text-right flex-shrink-0">
+            <span className="text-xs text-muted-foreground">
+              {log.lineNumber}
+            </span>
           </div>
-          <div className="flex-1 min-w-0">
-            {diff && diff.tokens.length > 0 && isExpanded ? (
-              // Only show diff tokens when fully expanded
-              <div className="flex flex-wrap gap-0">{renderDiffTokens(diff.tokens)}</div>
-            ) : (
-              // Show plain text when truncated or on initial view
-              <span className="text-foreground">{displayMessage}</span>
-            )}
+
+          {/* Content */}
+          <div className="flex-1 min-w-0 overflow-x-hidden">
+            {shouldShowDiffTokens ? (
+  <div className="w-full whitespace-pre-wrap break-all text-foreground">
+    {renderDiffTokens(displayTokens, isExpanded, isExtraLine)}
+  </div>
+) : (
+  <div className="whitespace-pre-wrap break-all text-foreground">
+    {isExpanded ? message : truncateMessage(message)}
+  </div>
+)}
           </div>
         </div>
-        {isTruncated && (
-          <div className="px-4 pb-2">
+
+        {/* BOTTOM ROW: BUTTON */}
+        {shouldShowButton && (
+          <div className="pl-12">
             <Button
               variant="ghost"
               size="sm"
+              className="gap-1 text-xs h-7 border border-border"
               onClick={() => {
-                const newSet = new Set(expandedMessages);
-                if (newSet.has(logKey)) {
-                  newSet.delete(logKey);
-                } else {
-                  newSet.add(logKey);
-                }
-                setExpandedMessages(newSet);
+                setExpandedMessages(prev => ({
+                  ...prev,
+                  [expansionKey]: !prev[expansionKey]
+                }));
               }}
-              className="gap-1 text-xs h-8"
+
             >
               {isExpanded ? (
                 <>
                   <ChevronUp className="h-3 w-3" />
-                  Collapse
+                 Collapse
                 </>
               ) : (
                 <>
                   <ChevronDown className="h-3 w-3" />
-                  Expand ({remainingChars} more characters)
+                 Expand
                 </>
               )}
             </Button>
           </div>
         )}
+
       </div>
     );
+  };
+
+  const renderRows = () => {
+    return diffs.map((diff, idx) => {
+      const rowKey = `row-${idx}`;
+
+      return (
+        <div key={rowKey} className="grid grid-cols-2 border-b border-border">
+
+          {/* LEFT PANEL */}
+          <div
+            className={cn(
+              "border-r border-border border-l-4",
+              {
+                "border-l-red-500": diff.pair.failed,   // normal / left exists
+                "border-l-transparent": !diff.pair.failed // missing
+              }
+            )}
+          >
+            {renderLogContent(
+              diff.pair.failed,
+              diff.leftDiff,
+              rowKey,
+              diff.pair.failed,
+              diff.pair.successful
+            )}
+          </div>
+
+          {/* RIGHT PANEL */}
+          <div
+            className={cn(
+              "border-l-4",
+              {
+                "border-l-green-500": diff.pair.successful,
+                "border-l-transparent": !diff.pair.successful
+              }
+            )}
+          >
+            {renderLogContent(
+              diff.pair.successful,
+              diff.rightDiff,
+              rowKey,
+              diff.pair.failed,
+              diff.pair.successful
+            )}
+          </div>
+
+        </div>
+      );
+    });
   };
 
   // Loading state
@@ -275,21 +403,6 @@ const PassFailComparison: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Scroll mode selector */}
-          <div className="flex items-center gap-2">
-            <label className="text-sm font-medium text-foreground">Scroll:</label>
-            <Select value={scrollMode} onValueChange={(v) => handleScrollModeChange(v as ScrollMode)}>
-              <SelectTrigger className="w-40">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="sync">Synchronized</SelectItem>
-                <SelectItem value="independent">Independent</SelectItem>
-                <SelectItem value="unified">Unified</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
           {/* Raw view toggle */}
           <Button
             variant={showRawView ? 'default' : 'outline'}
@@ -323,96 +436,23 @@ const PassFailComparison: React.FC = () => {
         </div>
       </div>
 
-      {/* Comparison panels */}
-      {scrollMode === 'unified' ? (
-        // Unified scroll mode - single scrollable container with both columns
-        <div className="flex-1 overflow-y-auto border border-border rounded-lg bg-card">
-          <div className="grid grid-cols-2 gap-0">
-            {/* Left column header */}
-            <div className="sticky top-0 z-20 px-4 py-3 bg-red-500/10 border-r border-b border-border">
-              <h2 className="text-sm font-semibold text-red-600 dark:text-red-400">
-                Failed Testcase
-              </h2>
-            </div>
-            {/* Right column header */}
-            <div className="sticky top-0 z-20 px-4 py-3 bg-green-500/10 border-b border-border">
-              <h2 className="text-sm font-semibold text-green-600 dark:text-green-400">
-                Successful Testcase
-              </h2>
-            </div>
+      {/* Comparison panels - Content wraps within container boundaries */}
+      <div className="flex flex-col border border-border rounded-lg bg-card">
 
-            {/* Log rows */}
-            {diffs.map((diff, idx) => (
-              <React.Fragment key={idx}>
-                {/* Left log */}
-                <div className="border-r border-b border-border hover:bg-muted/40 transition-colors border-l-4 border-l-red-500">
-                  {renderLogContent(diff.pair.failed, diff.leftDiff, idx, 'left')}
-                </div>
-
-                {/* Right log */}
-                <div className="border-b border-border hover:bg-muted/40 transition-colors border-l-4 border-l-green-500">
-                  {renderLogContent(diff.pair.successful, diff.rightDiff, idx, 'right')}
-                </div>
-              </React.Fragment>
-            ))}
+        {/* Header Row */}
+        <div className="grid grid-cols-2 border-b border-border font-semibold text-sm">
+          <div className="px-4 py-3 bg-red-500/10 text-red-600 dark:text-red-400 border-r border-border">
+            Failed Testcase ({failedLogs.length})
+          </div>
+          <div className="px-4 py-3 bg-green-500/10 text-green-600 dark:text-green-400">
+            Successful Testcase ({successfulLogs.length})
           </div>
         </div>
-      ) : (
-        // Sync or Independent scroll mode - two separate scrollable panels
-        <div className="flex-1 grid grid-cols-2 gap-4">
-          {/* Left panel */}
-          <div
-            ref={leftScrollContainerRef}
-            className="flex flex-col overflow-y-auto border border-border rounded-lg"
-            onScroll={handleLeftScroll}
-          >
-            <div className="sticky top-0 z-10 px-4 py-3 bg-red-500/10 border-b border-border">
-              <h2 className="text-sm font-semibold text-red-600 dark:text-red-400">
-                Failed Testcase ({failedLogs.length})
-              </h2>
-            </div>
-            <div className="flex-1">
-              {diffs.map((diff, idx) => (
-                <div 
-                  key={idx} 
-                  className="border-b border-border last:border-b-0 hover:bg-muted/40 transition-colors border-l-4 border-l-red-500"
-                >
-                  {renderLogContent(diff.pair.failed, diff.leftDiff, idx, 'left')}
-                </div>
-              ))}
-            </div>
-            <div className="sticky bottom-0 z-10 px-4 py-2 bg-muted/30 border-t border-border text-xs text-muted-foreground">
-              {failedLogs.length} logs
-            </div>
-          </div>
 
-          {/* Right panel */}
-          <div
-            ref={rightScrollContainerRef}
-            className="flex flex-col overflow-y-auto border border-border rounded-lg"
-            onScroll={handleRightScroll}
-          >
-            <div className="sticky top-0 z-10 px-4 py-3 bg-green-500/10 border-b border-border">
-              <h2 className="text-sm font-semibold text-green-600 dark:text-green-400">
-                Successful Testcase ({successfulLogs.length})
-              </h2>
-            </div>
-            <div className="flex-1">
-              {diffs.map((diff, idx) => (
-                <div 
-                  key={idx} 
-                  className="border-b border-border last:border-b-0 hover:bg-muted/40 transition-colors border-l-4 border-l-green-500"
-                >
-                  {renderLogContent(diff.pair.successful, diff.rightDiff, idx, 'right')}
-                </div>
-              ))}
-            </div>
-            <div className="sticky bottom-0 z-10 px-4 py-2 bg-muted/30 border-t border-border text-xs text-muted-foreground">
-              {successfulLogs.length} logs
-            </div>
-          </div>
-        </div>
-      )}
+        {/* Diff Rows */}
+        {renderRows()}
+
+      </div>
 
     </div>
   );
